@@ -150,10 +150,7 @@ const DashboardView = ({ accountBalance, paymentHistory, handleCategoryClick, se
                 {paymentHistory
                   .filter(payment => 
                     payment.type === 'BILL_PAYMENT' || 
-                    payment.type === 'RECHARGE' ||
-                    payment.type === 'TAX_DIRECT' ||
-                    payment.type === 'TAX_GST' ||
-                    payment.type === 'TAX_STATE'
+                    payment.type === 'RECHARGE'
                   )
                   .slice(0, 3)
                   .map((payment) => (
@@ -400,15 +397,14 @@ const HistoryView = ({ resetToDashboard, paymentHistory, clearAllData }) => {
     const [filterType, setFilterType] = useState('all');
     const filteredHistory = useMemo(() => paymentHistory
       .filter(p => {
-        // First filter: Only show bill payment related transactions
-        const billPaymentTypes = ['BILL_PAYMENT', 'RECHARGE', 'TAX_DIRECT', 'TAX_GST', 'TAX_STATE'];
+        // First filter: Only show bill payment related transactions (excluding tax payments)
+        const billPaymentTypes = ['BILL_PAYMENT', 'RECHARGE'];
         if (!billPaymentTypes.includes(p.type)) return false;
         
         // Second filter: Apply user selected filter
         if (filterType === 'all') return true;
         if (filterType === 'bill') return p.type === 'BILL_PAYMENT';
         if (filterType === 'recharge') return p.type === 'RECHARGE';
-        if (filterType === 'tax') return ['TAX_DIRECT', 'TAX_GST', 'TAX_STATE'].includes(p.type);
         return p.type === filterType;
       })
       .filter(p => {

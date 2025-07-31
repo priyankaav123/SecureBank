@@ -19,7 +19,7 @@ import BillPayments from "./pages/BillPayments";
 import ETax from "./pages/ETax";
 import FixedDeposits from "./pages/FixedDeposits";
 import StockInvestments from "./pages/StockInvestments";
-
+import SessionMonitor from "./pages/SessionMonitor";
 const App = () => (
   <TooltipProvider>
     <AuthProvider>
@@ -97,7 +97,14 @@ const App = () => (
                 </ProtectedRoute>
               }
             />
-
+            <Route
+              path="/session-monitor"
+              element={
+                <ProtectedRoute>
+                  <SessionMonitor />
+                </ProtectedRoute>
+              }
+            />
             {/* Catch-all route */}
             <Route path="*" element={<NotFound />} />
           </Routes>

@@ -85,7 +85,170 @@ class KeystrokeAuthenticator:
 
 # Global authenticator instance
 authenticator = None
+class UserBehaviorProfiler:
+    """
+    Analyzes user behavior sessions to detect anomalies based on historical event data.
+    """
+    def __init__(self, session_timeout_minutes=30):
+        self.model = None
+        self.scaler = None
+        self.feature_columns = None
+        self.session_timeout = pd.Timedelta(minutes=session_timeout_minutes)
+        self.min_score_ = None
+        self.max_score_ = None
+        # Define a canonical list of event types to ensure feature consistency
+        self.canonical_event_types = [
+            'login_success', 'login_failed', 'logout', 'bill_payment', 'recharge', 
+            'own_account_transfer', 'beneficiary_transfer', 'stocks_view', 
+            'stock_buy', 'stock_sell', 'portfolio_view', 'fd_created', 
+            'fd_details_view', 'fd_certificate_download', 'fd_export',
+            'account_statement_view', 'account_statement_export'
+        ]
 
+    def _preprocess_and_create_sessions(self, df_events: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        Takes raw event data, groups it into sessions, and engineers features.
+        """
+        if df_events.empty:
+            return None
+
+        df = df_events.copy()
+        df['time'] = pd.to_datetime(df['time'])
+        df = df.sort_values(by='time')
+
+        # Identify sessions
+        df['time_diff'] = df['time'].diff()
+        # A new session starts if the time gap is > session_timeout or the event is a login
+        # Also, treat logout as ending the current session (next event will start a new session)
+        session_starts = (df['time_diff'] > self.session_timeout) | (df['event_type'] == 'login_success')
+        
+        # Create session boundaries: logout events end sessions, login events start new ones
+        df['session_boundary'] = session_starts.copy()
+        
+        # Mark the event AFTER a logout as starting a new session
+        logout_mask = df['event_type'] == 'logout'
+        if logout_mask.any():
+            logout_indices = df[logout_mask].index
+            for logout_idx in logout_indices:
+                # Find the next event after this logout
+                next_events = df.index[df.index > logout_idx]
+                if len(next_events) > 0:
+                    next_idx = next_events[0]
+                    df.loc[next_idx, 'session_boundary'] = True
+        
+        df['session_id'] = df['session_boundary'].cumsum()
+
+        # Feature Engineering
+        session_features = []
+        for session_id, session_df in df.groupby('session_id'):
+            if session_df.empty:
+                continue
+
+            start_time = session_df['time'].min()
+            end_time = session_df['time'].max()
+
+            # Basic Features
+            features = {
+                'session_duration_seconds': (end_time - start_time).total_seconds(),
+                'event_count': len(session_df),
+                'hour_of_day': start_time.hour,
+                'day_of_week': start_time.dayofweek,
+            }
+
+            # Transaction Features
+            transactions = session_df[session_df['transaction_amount'] > 0]
+            features['total_transaction_amount'] = transactions['transaction_amount'].sum()
+            features['mean_transaction_amount'] = transactions['transaction_amount'].mean() if not transactions.empty else 0
+            features['max_transaction_amount'] = transactions['transaction_amount'].max() if not transactions.empty else 0
+            features['transaction_count'] = len(transactions)
+
+            # Event Type Frequencies (One-Hot Encoding style)
+            event_counts = session_df['event_type'].value_counts().to_dict()
+            for event_type in self.canonical_event_types:
+                features[f'event_{event_type}'] = event_counts.get(event_type, 0)
+            
+            session_features.append(features)
+
+        if not session_features:
+            return None
+            
+        return pd.DataFrame(session_features)
+
+    def fit(self, user_events_df: pd.DataFrame):
+        """
+        Trains the anomaly detection model on a user's historical sessions.
+        """
+        print(f"Training behavior profiler for user: {user_events_df['user_email'].iloc[0]}")
+        
+        session_df = self._preprocess_and_create_sessions(user_events_df)
+        
+        if session_df is None or len(session_df) < 5: # Need a minimum number of sessions to train
+            print(f"Skipping training for user due to insufficient session data ({len(session_df) if session_df is not None else 0} sessions).")
+            print(session_df)
+            self.model = None
+            return
+
+        self.feature_columns = session_df.columns
+        X = session_df[self.feature_columns]
+
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X)
+
+        self.model = IsolationForest(contamination='auto', random_state=42)
+        self.model.fit(X_scaled)
+
+        training_scores = self.model.decision_function(X_scaled)
+        self.min_score_ = training_scores.min()
+        self.max_score_ = training_scores.max()
+
+        print("Behavior profiler training complete.")
+
+    def predict(self, current_session_events: List[Dict]) -> Dict:
+        """
+        Analyzes a new session and predicts if it's an anomaly.
+        """
+        if not self.model:
+            return {
+                "status": "NotApplicable",
+                "anomaly_confidence_percent": 0.0,
+                "raw_score": 0.0,
+                "reason": "Behavior model not trained for this user."
+            }
+        
+        # Create a DataFrame from the list of event dictionaries
+        session_df = pd.DataFrame(current_session_events)
+
+        # Preprocess this single session to get its feature vector
+        features_df = self._preprocess_and_create_sessions(session_df)
+        
+        if features_df is None:
+            return { "status": "Error", "reason": "Could not process session events." }
+
+        # Ensure the feature DataFrame has the same columns as the training data
+        # This handles cases where a new session is missing certain event types
+        input_vector = features_df.reindex(columns=self.feature_columns, fill_value=0)
+
+        input_scaled = self.scaler.transform(input_vector)
+        raw_score = self.model.decision_function(input_scaled)[0]
+        status = "Anomaly" if raw_score < 0 else "Normal"
+
+        # Safely calculate confidence
+        score_range = self.max_score_ - self.min_score_
+        if score_range == 0:
+            normalized_score = 0.5
+        else:
+            normalized_score = (raw_score - self.min_score_) / score_range
+        
+        normalized_score = np.clip(normalized_score, 0, 1)
+        anomaly_confidence = (1 - normalized_score) * 100
+
+        return {
+            "status": status,
+            "anomaly_confidence_percent": round(anomaly_confidence, 2),
+            "raw_score": round(raw_score, 4)
+        }
+    
+behavior_profilers = {}
 def train_model_on_startup():
     """
     Loads data, trains the model for a specific user, and returns the
@@ -117,6 +280,8 @@ def train_model_on_startup():
     except Exception as e:
         print(f"FATAL ERROR during model training: {e}")
         authenticator = None
+        # --- Behavioral Model Training (Dynamic) ---
+    print("--- Server is starting: Behavioral models will be trained dynamically on user login ---")
 
 app = Flask(__name__)
 app.config['JWT_SECRET_KEY'] = 'your-secret-key-change-in-production'
@@ -125,6 +290,52 @@ app.config['DEBUG'] = True
 app.config['PROPAGATE_EXCEPTIONS'] = True
 jwt = JWTManager(app)
 CORS(app, resources={r"/api/*": {"origins": "http://localhost:5173"}}, supports_credentials=True)
+
+# --- Behavioral Model Training Function ---
+def train_user_behavioral_model(user_email, min_events=20):
+    """
+    Train a behavioral model for a specific user if they have sufficient historical data.
+    Returns True if training was successful, False otherwise.
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # Check if user has sufficient event data
+        cursor.execute("SELECT COUNT(*) as event_count FROM user_events WHERE user_email = ?", (user_email,))
+        event_count = cursor.fetchone()['event_count']
+        
+        if event_count < min_events:
+            print(f"User {user_email} has insufficient data for behavioral training ({event_count} events, need {min_events})")
+            conn.close()
+            return False
+        
+        # Load historical events for this user
+        df_events = pd.read_sql_query("SELECT * FROM user_events WHERE user_email = ?", conn, params=(user_email,))
+        conn.close()
+        
+        if df_events.empty:
+            print(f"No event data found for user {user_email}")
+            return False
+        
+        print(f"Training behavioral model for {user_email} with {event_count} events...")
+        
+        # Instantiate and train the profiler
+        user_profiler = UserBehaviorProfiler()
+        user_profiler.fit(df_events)
+        
+        # Store the trained profiler in our dictionary
+        if user_profiler.model:
+            behavior_profilers[user_email] = user_profiler
+            print(f"Behavioral profile trained successfully for {user_email}")
+            return True
+        else:
+            print(f"Failed to train behavioral model for {user_email}")
+            return False
+            
+    except Exception as e:
+        print(f"Error training behavioral model for {user_email}: {e}")
+        return False
 
 # Database setup
 DATABASE = 'banking.db'
@@ -365,7 +576,7 @@ def initialize_sample_data():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         demo_user_id,
-        'pranav1233@gmail.com',
+        'priyankaavijay04@gmail.com',
         generate_password_hash('.tie5Roanl'),
         'Pranav',
         'Madhu',
@@ -626,7 +837,55 @@ def predict_keystroke():
     except Exception as e:
         # Handle other unexpected errors
         return jsonify({"error": f"An internal server error occurred: {e}"}), 500
+    
+@app.route('/api/behavior/analyze-session', methods=['POST'])
+@jwt_required()
+def analyze_user_session():
+    """
+    Receives a list of events from a user's current session and analyzes it for anomalies.
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json()
 
+    if not data or 'events' not in data or not isinstance(data['events'], list):
+        return jsonify({"error": "Invalid input: A JSON object with an 'events' list is required."}), 400
+
+    session_events = data['events']
+    
+    # Get the user's email to find the correct profiler
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user:
+        return jsonify({"error": "User not found."}), 404
+    
+    user_email = user['email']
+
+    # Find the profiler for the current user
+    profiler = behavior_profilers.get(user_email)
+
+    if not profiler:
+        # Try to train a model on-demand if this user has sufficient historical data
+        print(f"No behavioral model found for {user_email}, attempting on-demand training...")
+        success = train_user_behavioral_model(user_email)
+        if success:
+            profiler = behavior_profilers.get(user_email)
+        else:
+            return jsonify({
+                "status": "NotApplicable", 
+                "reason": f"No behavior model available for user {user_email}. Insufficient historical data (need at least 20 events for training)."
+            }), 200
+
+    try:
+        # The UserBehaviorProfiler expects a list of dictionaries, which is what we're sending
+        result = profiler.predict(session_events)
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error during behavior prediction for {user_email}: {e}", exc_info=True)
+        return jsonify({"error": f"An internal server error occurred during analysis: {e}"}), 500
 @app.errorhandler(Exception)
 def handle_error(error):
     print(f"\n=== Error in API ===")
@@ -674,6 +933,8 @@ def biometric_login():
         # If password is correct, now proceed with biometric verification
         if authenticator is None:
             conn.close()
+            # Track biometric system unavailable as a failure
+            track_user_event(user['email'], 'login_failed', '/login', 0, 'biometric', json.dumps({'reason': 'Biometric system not available'}))
             return jsonify({'success': False, 'error': 'Biometric system not available'}), 500
         
         try:
@@ -694,7 +955,7 @@ def biometric_login():
             cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (user['id'],))
             conn.commit()
             
-            # Track successful login
+            # Track successful biometric login (for session management)
             track_user_event(user['email'], 'login_success', '/login', 0, 'biometric', json.dumps({'user_id': user['id']}))
 
             token = create_access_token(identity=user['id'])
@@ -724,10 +985,20 @@ def biometric_login():
             
         except Exception as e:
             conn.close()
+            # Track biometric system error as a failure
+            if 'user' in locals() and user:
+                track_user_event(user['email'], 'login_failed', '/login', 0, 'biometric', json.dumps({'reason': 'Biometric system error', 'error': str(e)}))
             logging.error(f"Biometric verification error: {e}", exc_info=True)
             return jsonify({'success': False, 'error': f'Biometric verification error: {str(e)}'}), 500
         
     except Exception as e:
+        # Track general biometric login error - try to get email from request data
+        try:
+            data = request.get_json()
+            if data and 'email' in data:
+                track_user_event(data['email'], 'login_failed', '/login', 0, 'biometric', json.dumps({'reason': 'General login error', 'error': str(e)}))
+        except:
+            pass  # If we can't track the event, don't fail the error response
         logging.error(f"General biometric login error: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
     
@@ -910,6 +1181,14 @@ def login():
         
         # Track login event
         track_user_event(user['email'], 'login', '/login', 0, None, json.dumps({'user_id': user['id']}))
+        
+        # Train behavioral model for this user if not already trained and they have sufficient data
+        user_email = user['email']
+        if user_email not in behavior_profilers:
+            print(f"Attempting to train behavioral model for {user_email} on login...")
+            train_user_behavioral_model(user_email)
+        else:
+            print(f"Behavioral model already exists for {user_email}")
         
         # Create access token
         token = create_access_token(identity=user['id'])
@@ -1470,10 +1749,24 @@ def get_profile():
 
 # Logout route
 @app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
+@jwt_required()
 def logout():
     if request.method == 'OPTIONS':
         return '', 200
     try:
+        user_id = get_jwt_identity()
+        
+        # Get user's email for event tracking
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT email FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if user:
+            # Track logout event
+            track_user_event(user['email'], 'logout', '/logout', 0, 'logout', None)
+        
         return jsonify({
             'success': True,
             'message': 'Logout successful',
@@ -1869,6 +2162,81 @@ def get_transactions():
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+# Make sure you have these imports
+import datetime
+import logging
+
+# ... (other routes) ...
+
+@app.route('/api/behavior/current-session', methods=['GET'])
+@jwt_required()
+def get_current_session_events():
+    """
+    Retrieves all events for the logged-in user from their most recent
+    'login_success' event to the present. This defines the "current session".
+    """
+    try:
+        user_id = get_jwt_identity()
+        
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # 1. Get user's email for the query
+        cursor.execute("SELECT email FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        if not user:
+            conn.close()
+            return jsonify({'success': False, 'error': 'User not found'}), 404
+        
+        user_email = user['email']
+
+        # 2. Find the timestamp of the most recent 'login_success' event for this user
+        cursor.execute("""
+            SELECT MAX(time) 
+            FROM user_events 
+            WHERE user_email = ? AND event_type = 'login_success'
+        """, (user_email,))
+        last_login_time_row = cursor.fetchone()
+
+        # If the user has never logged in (or events were cleared), return empty
+        if not last_login_time_row or not last_login_time_row[0]:
+            conn.close()
+            return jsonify({'success': True, 'session_events': []})
+
+        last_login_time = last_login_time_row[0]
+        
+        # 3. Fetch all events that occurred since the last login
+        query = """
+            SELECT id, event_type, time, page_url, transaction_amount, additional_data
+            FROM user_events 
+            WHERE user_email = ? AND time >= ?
+            ORDER BY time ASC
+        """
+        cursor.execute(query, (user_email, last_login_time))
+        session_events = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+            
+        return jsonify({
+            'success': True,
+            'session_events': session_events
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting current session: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+    
+
+
+# In app.py
+# Make sure you have the UserBehaviorProfiler class from our previous discussion
+
+# ... (other global variables)
+# behavior_profilers = {} # This should be initialized at the top
+
+# ... (train_model_on_startup should be training and populating the behavior_profilers dict)
+
 
 # Fixed Deposits routes
 @app.route('/api/fixed-deposits', methods=['GET'])
@@ -2456,8 +2824,8 @@ def pay_direct_tax():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Check user balance
-    cursor.execute("SELECT balance FROM users WHERE id = ?", (user_id,))
+    # Check user balance and get email
+    cursor.execute("SELECT balance, email FROM users WHERE id = ?", (user_id,))
     user = cursor.fetchone()
     if not user or user['balance'] < amount:
         conn.close()
@@ -2490,6 +2858,8 @@ def pay_direct_tax():
         ))
         
         conn.commit()
+        track_user_event(user['email'], 'tax_payment_direct', '/tax/direct', amount, 'tax_payment', 
+                         json.dumps({'pan': data['pan'], 'assessmentYear': data['assessmentYear']}))
         conn.close()
         
         return jsonify({

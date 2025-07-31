@@ -45,7 +45,7 @@ const DirectTaxView = ({ onBack, onSubmit, isLoading }) => {
       toast.error("Invalid Details", { description: "Please enter a valid 10-digit PAN and a positive amount." });
       return;
     }
-    onSubmit({ ...form, paymentMethod: 'Direct Debit', summary: `PAN: ${form.pan.toUpperCase()}` });
+    onSubmit(form);
   };
   return (
     <div className="space-y-6">
@@ -80,7 +80,7 @@ const GstView = ({ onBack, onSubmit, isLoading }) => {
             toast.error("Invalid Details", { description: "Please enter a valid 15-digit GSTIN, CPIN, and tax amounts." });
             return;
         }
-        onSubmit({ ...form, amount: total, summary: `GSTIN: ${form.gstin.toUpperCase()}` });
+        onSubmit({ ...form, amount: total });
     };
     return (
         <div className="space-y-6">
@@ -122,7 +122,7 @@ const StateTaxView = ({ onBack, onSubmit, isLoading }) => {
             toast.error("All Fields Required", { description: "Please complete all steps to pay your state tax." });
             return;
         }
-        onSubmit({ ...form, summary: `${form.service} ID: ${form.consumerId}` });
+        onSubmit(form);
     }
     return (
         <div className="space-y-6">
@@ -244,13 +244,22 @@ export default function ETax() {
       let paymentType = '';
       
       if (currentView === 'direct') {
-        response = await taxApi.payDirectTax(formData, addNotification);
+        response = await taxApi.payDirectTax({
+          ...formData,
+          amount: parseFloat(formData.amount)
+        }, addNotification);
         paymentType = 'Direct Tax';
       } else if (currentView === 'gst') {
-        response = await taxApi.payGst(formData, addNotification);
+        response = await taxApi.payGst({
+          ...formData,
+          amount: parseFloat(formData.amount)
+        }, addNotification);
         paymentType = 'GST Payment';
       } else if (currentView === 'state') {
-        response = await taxApi.payStateTax(formData, addNotification);
+        response = await taxApi.payStateTax({
+          ...formData,
+          amount: parseFloat(formData.amount)
+        }, addNotification);
         paymentType = 'State Tax';
       }
       
@@ -258,7 +267,7 @@ export default function ETax() {
         await fetchAndSetProfile(); // Update user balance
         await loadTaxHistory(); // Reload tax history
         toast.success(`${paymentType} Payment Successful!`, { 
-          description: `Paid ₹${formData.amount.toLocaleString('en-IN')}` 
+          description: `Paid ₹${parseFloat(formData.amount).toLocaleString('en-IN')}` 
         });
         setCurrentView('dashboard');
       } else {
