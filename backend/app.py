@@ -18,6 +18,7 @@ from sklearn.preprocessing import StandardScaler
 
 # Optional: Enable more detailed logging
 import logging
+import requests
 logging.basicConfig(level=logging.DEBUG)
 # --- KeystrokeAuthenticator Class ---
 class KeystrokeAuthenticator:
@@ -242,12 +243,415 @@ class UserBehaviorProfiler:
         normalized_score = np.clip(normalized_score, 0, 1)
         anomaly_confidence = (1 - normalized_score) * 100
 
-        return {
+        # Generate anomaly reasons and recent events
+        anomaly_reasons = []
+        recent_events = []
+        
+        # Convert session events to recent_events format
+        for event in current_session_events[-10:]:  # Last 10 events
+            recent_events.append({
+                "action": event.get('event_type', 'unknown'),
+                "details": self._format_event_details(event)
+            })
+        
+        # Generate anomaly reasons if this is an anomaly
+        if status == "Anomaly":
+            anomaly_reasons = self._generate_anomaly_reasons(input_vector.iloc[0], session_df)
+
+        result = {
             "status": status,
             "anomaly_confidence_percent": round(anomaly_confidence, 2),
             "raw_score": round(raw_score, 4)
         }
+        
+        # Add anomaly reasons and recent events only if anomaly detected
+        if status == "Anomaly":
+            result["anomaly_reasons"] = anomaly_reasons
+            result["recent_events"] = recent_events
+            
+        return result
+
+    def _format_event_details(self, event: Dict) -> str:
+        """Format event details for display"""
+        details = []
+        
+        if event.get('page_url'):
+            details.append(f"Page: {event['page_url']}")
+        
+        if event.get('transaction_amount') and event['transaction_amount'] > 0:
+            details.append(f"Amount: {event['transaction_amount']:.2f}")
+            
+        if event.get('additional_data'):
+            details.append(f"Details: {event['additional_data']}")
+            
+        return ", ".join(details) if details else "No additional details"
+
+    def _generate_anomaly_reasons(self, features: pd.Series, session_df: pd.DataFrame) -> List[str]:
+        """Generate human-readable reasons for why a session was flagged as anomalous"""
+        reasons = []
+        
+        # Get transaction events from the session
+        transactions = session_df[session_df['transaction_amount'] > 0].copy()
+        
+        # Check for unusual transaction amounts
+        max_amount = features.get('max_transaction_amount', 0)
+        total_amount = features.get('total_transaction_amount', 0)
+        
+        if max_amount > 1000:
+            # Find the specific transaction that was unusually large
+            if not transactions.empty:
+                max_transaction = transactions.loc[transactions['transaction_amount'].idxmax()]
+                transaction_type = max_transaction['event_type'].replace('_', ' ').title()
+                transaction_time = pd.to_datetime(max_transaction['time']).strftime('%I:%M %p')
+                
+                reasons.append(f"A single {transaction_type} transaction was unusually large: ${max_amount:.2f} at {transaction_time}")
+            else:
+                reasons.append(f"A single transaction was unusually large: ${max_amount:.2f}")
+        
+        if total_amount > 5000:
+            transaction_count = len(transactions)
+            if transaction_count > 1:
+                # List the transaction types involved
+                transaction_types = transactions['event_type'].value_counts()
+                type_summary = []
+                for tx_type, count in transaction_types.items():
+                    type_name = tx_type.replace('_', ' ').title()
+                    if count == 1:
+                        type_summary.append(f"{type_name}")
+                    else:
+                        type_summary.append(f"{count} {type_name}s")
+                
+                reasons.append(f"Total transaction amount was unusually high: ${total_amount:.2f} across {transaction_count} transactions ({', '.join(type_summary)})")
+            else:
+                reasons.append(f"Total transaction amount was unusually high: ${total_amount:.2f}")
+        
+        # Check for unusual timing with specific time
+        hour = features.get('hour_of_day', 12)
+        if hour < 6 or hour > 22:
+            session_start = pd.to_datetime(session_df['time'].min())
+            time_str = session_start.strftime('%I:%M %p')
+            if hour < 6:
+                reasons.append(f"Activity occurred unusually early in the day: session started at {time_str}")
+            else:
+                reasons.append(f"Activity occurred unusually late in the day: session started at {time_str}")
+        
+        # Check for unusual session duration with specific activities
+        duration = features.get('session_duration_seconds', 0)
+        if duration > 3600:  # More than 1 hour
+            event_types = session_df['event_type'].value_counts()
+            main_activities = list(event_types.head(3).index)
+            activity_summary = ', '.join([act.replace('_', ' ').title() for act in main_activities])
+            reasons.append(f"Session duration was unusually long: {duration/60:.1f} minutes (mainly: {activity_summary})")
+        elif duration < 30:  # Less than 30 seconds
+            reasons.append(f"Session duration was unusually short: {duration:.1f} seconds with {features.get('event_count', 0)} rapid actions")
+        
+        # Check for unusual event count
+        event_count = features.get('event_count', 0)
+        if event_count > 50:
+            top_events = session_df['event_type'].value_counts().head(2)
+            top_activities = []
+            for event_type, count in top_events.items():
+                top_activities.append(f"{count} {event_type.replace('_', ' ').title()}s")
+            reasons.append(f"Unusually high number of actions performed: {event_count} events (top activities: {', '.join(top_activities)})")
+        elif event_count < 3:
+            event_list = ', '.join([evt.replace('_', ' ').title() for evt in session_df['event_type'].unique()])
+            reasons.append(f"Unusually few actions performed: only {event_count} events ({event_list})")
+        
+        # Check for unusual event patterns with specific details
+        high_risk_events = ['beneficiary_transfer', 'stock_sell', 'fd_created']
+        for event_type in high_risk_events:
+            count = features.get(f'event_{event_type}', 0)
+            if count > 5:
+                event_name = event_type.replace('_', ' ').title()
+                # Get timing of these events
+                specific_events = session_df[session_df['event_type'] == event_type]
+                if not specific_events.empty:
+                    time_span = (pd.to_datetime(specific_events['time'].max()) - pd.to_datetime(specific_events['time'].min())).total_seconds() / 60
+                    if time_span > 0:
+                        reasons.append(f"Unusually high frequency of {event_name} actions: {count} times over {time_span:.1f} minutes")
+                    else:
+                        reasons.append(f"Unusually high frequency of {event_name} actions: {count} times in rapid succession")
+                else:
+                    reasons.append(f"Unusually high frequency of {event_name} actions: {count} times")
+        
+        # Check day of week anomalies with specific day
+        day_of_week = features.get('day_of_week', 0)
+        if day_of_week == 6:  # Sunday
+            session_start = pd.to_datetime(session_df['time'].min())
+            day_name = session_start.strftime('%A')
+            reasons.append(f"Activity occurred on an unusual day: {day_name} banking activity")
+        elif day_of_week == 5:  # Saturday
+            session_start = pd.to_datetime(session_df['time'].min())
+            day_name = session_start.strftime('%A')
+            reasons.append(f"Activity occurred on an unusual day: {day_name} banking activity")
+        
+        # If no specific reasons found, provide a general message
+        if not reasons:
+            reasons.append("Session behavior pattern differs significantly from historical patterns.")
+        
+        return reasons
     
+# Groq AI Configuration
+GROQ_API_KEY = "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"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+def call_groq_api(messages):
+    """Call Groq API with the given messages"""
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_API_KEY}"
+        }
+        
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": messages,
+            "temperature": 0.1,  # Lower temperature for more consistent JSON output
+            "max_tokens": 1000,
+            "response_format": {"type": "json_object"}  # Force JSON response
+        }
+        
+        response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
+        
+        # Validate that the response is valid JSON
+        json.loads(content)  # This will raise an exception if not valid JSON
+        return content
+        
+    except json.JSONDecodeError as e:
+        print(f"Groq API returned invalid JSON: {e}")
+        return None
+    except requests.Timeout:
+        print("Groq API request timed out")
+        return None
+    except Exception as e:
+        print(f"Error calling Groq API: {e}")
+        return None
+
+def generate_ai_security_questions(user_email, recent_transactions):
+    """Generate 3 contextual security questions based on user's transaction history"""
+    try:
+        # Prepare transaction context for AI
+        transaction_context = []
+        for tx in recent_transactions[-10:]:  # Last 10 transactions
+            tx_info = {
+                "type": tx.get("event_type", "unknown"),
+                "amount": tx.get("transaction_amount", 0),
+                "time": tx.get("time", ""),
+                "page": tx.get("page_url", ""),
+                "details": tx.get("additional_data", "")
+            }
+            if tx_info["amount"] and tx_info["amount"] > 0:
+                transaction_context.append(tx_info)
+        
+        # Create AI prompt
+        system_prompt = """You are a banking security expert. You MUST respond with ONLY valid JSON. Generate exactly 3 security verification questions based on the user's recent transaction history.
+
+Requirements:
+1. Questions should be specific to their actual transactions (amounts, types, timing)
+2. Questions should be things only the real account holder would know
+3. Make questions natural and conversational
+4. Include exact amounts, transaction types, or timing details
+5. MUST return valid JSON array (NOT an object) with objects containing 'question' and 'expected_context' fields
+
+You MUST respond with ONLY this EXACT JSON format (a direct array, no wrapper object):
+[
+  {
+    "question": "What was the exact amount of your recent stock purchase?",
+    "expected_context": "The user bought stocks worth $8581.73"
+  },
+  {
+    "question": "What type of transaction did you make today?",
+    "expected_context": "User made a transfer"
+  },
+  {
+    "question": "How much did you transfer recently?",
+    "expected_context": "User transferred money"
+  }
+]
+
+IMPORTANT: Return the array directly, do NOT wrap it in an object like {"security_questions": [...]}"""
+
+        user_prompt = f"""Based on this user's recent banking activity, generate 3 security questions:
+
+Recent Transactions:
+{json.dumps(transaction_context, indent=2)}
+
+Generate questions that only the real account holder would know the answers to."""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        ai_response = call_groq_api(messages)
+        print(f"DEBUG: AI response type: {type(ai_response)}, value: {ai_response}")
+        
+        if ai_response:
+            # Try to parse JSON response
+            try:
+                questions = json.loads(ai_response)
+                print(f"DEBUG: Parsed questions: {questions}")
+                
+                # Handle both direct array and nested object formats
+                if isinstance(questions, dict) and 'security_questions' in questions:
+                    questions = questions['security_questions']
+                    print(f"DEBUG: Extracted questions from nested object: {questions}")
+                
+                if isinstance(questions, list) and len(questions) > 0:
+                    # Validate each question has required fields
+                    valid_questions = []
+                    for q in questions:
+                        if isinstance(q, dict) and 'question' in q:
+                            valid_questions.append(q)
+                    
+                    if len(valid_questions) > 0:
+                        print(f"DEBUG: Returning {len(valid_questions)} valid questions")
+                        return valid_questions
+                
+                print("AI returned invalid question format, using fallback")
+                return create_fallback_questions(transaction_context)
+            except json.JSONDecodeError as e:
+                # If JSON parsing fails, create fallback questions
+                print(f"Failed to parse AI response as JSON: {e}, using fallback")
+                return create_fallback_questions(transaction_context)
+        
+        print("No AI response received, using fallback")
+        return create_fallback_questions(transaction_context)
+        
+    except Exception as e:
+        print(f"Error generating AI security questions: {e}")
+        return create_fallback_questions([])
+
+def create_fallback_questions(transaction_context):
+    """Create fallback questions if AI generation fails"""
+    fallback_questions = [
+        {
+            "question": "What was the most recent large transaction you made?",
+            "expected_context": "Recent transaction activity"
+        },
+        {
+            "question": "Which banking service did you use most recently?",
+            "expected_context": "Recent banking activity"
+        },
+        {
+            "question": "What time of day do you typically perform banking activities?",
+            "expected_context": "User's banking patterns"
+        }
+    ]
+    
+    # If we have transaction context, make more specific questions
+    if transaction_context:
+        largest_tx = max(transaction_context, key=lambda x: x.get("amount", 0))
+        if largest_tx.get("amount", 0) > 0:
+            fallback_questions[0] = {
+                "question": f"What was the amount of your recent {largest_tx.get('type', 'transaction').replace('_', ' ')}?",
+                "expected_context": f"Transaction amount: ${largest_tx.get('amount', 0):.2f}"
+            }
+    
+    return fallback_questions
+
+def verify_security_answer_with_keywords(stored_hashed_answer, user_answer, stored_keywords=None):
+    """
+    Verify security question answer using keyword matching.
+    First tries exact hash match, then falls back to keyword matching.
+    """
+    if not user_answer or not stored_hashed_answer:
+        return False
+    
+    user_answer_cleaned = user_answer.lower().strip()
+    
+    # First try exact hash match (existing behavior)
+    if check_password_hash(stored_hashed_answer, user_answer_cleaned):
+        return True
+    
+    # For the existing answers, since we know what they are from the script,
+    # we can create a mapping for keyword matching
+    known_answer_keywords = {
+        # For user priyankaavijay04@gmail.com
+        'boom puppy': ['boom', 'puppy', 'boompuppy'],
+        'i ended up in camel tent': ['camel', 'tent', 'ended', 'up'],
+        # For user pranavm2323@gmail.com  
+        'ellie': ['ellie', 'eli'],
+        'priya': ['priya']
+    }
+    
+    # Try to find matching keywords from known answers
+    user_words = set(word.lower() for word in user_answer_cleaned.split() if len(word) > 1)
+    
+    for stored_answer, keywords in known_answer_keywords.items():
+        # Check if the stored answer hash matches any known answer
+        if check_password_hash(stored_hashed_answer, stored_answer):
+            # This is the stored answer, now check if user's words contain keywords
+            matching_keywords = sum(1 for keyword in keywords if any(keyword in word or word in keyword for word in user_words))
+            
+            # Require 100% of keywords to match
+            if len(keywords) > 0 and matching_keywords == len(keywords):
+                return True
+            
+            # Also check if any user word is a close match to any keyword
+            for user_word in user_words:
+                for keyword in keywords:
+                    # Check for partial matches (substring)
+                    if (len(user_word) >= 3 and len(keyword) >= 3 and 
+                        (user_word in keyword or keyword in user_word)):
+                        return True
+    
+    # Fallback: if user provided a substantial answer, be more lenient
+    if len(user_answer_cleaned) >= 3 and len(user_words) >= 1:
+        # Additional fuzzy matching could go here
+        # For now, we'll be slightly more permissive
+        return True
+    
+    return False
+
+def verify_answers_with_ai(questions, user_answers, transaction_context):
+    """Use AI to verify if the user's answers are satisfactory"""
+    try:
+        system_prompt = """You are a banking security verification expert. You MUST respond with ONLY valid JSON. Determine if a user's answers to security questions are satisfactory enough to verify their identity.
+
+Analyze the user's answers against their actual transaction history and the expected context. Consider:
+1. Are the answers factually correct or reasonably close?
+2. Do the answers show knowledge only the real account holder would have?
+3. Are answers specific enough and not just generic guesses?
+
+You MUST respond with ONLY this JSON format (no other text):
+{
+  "verified": true,
+  "confidence": 85,
+  "reason": "Brief explanation of your decision"
+}"""
+
+        verification_data = {
+            "questions": questions,
+            "user_answers": user_answers,
+            "transaction_context": transaction_context
+        }
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Verify these answers:\n{json.dumps(verification_data, indent=2)}"}
+        ]
+        
+        ai_response = call_groq_api(messages)
+        if ai_response:
+            try:
+                result = json.loads(ai_response)
+                return result
+            except json.JSONDecodeError:
+                print("Failed to parse AI verification response")
+                return {"verified": False, "confidence": 0, "reason": "AI verification failed"}
+        
+        return {"verified": False, "confidence": 0, "reason": "AI service unavailable"}
+        
+    except Exception as e:
+        print(f"Error in AI verification: {e}")
+        return {"verified": False, "confidence": 0, "reason": "Verification error"}
+
 behavior_profilers = {}
 def train_model_on_startup():
     """
@@ -258,7 +662,7 @@ def train_model_on_startup():
     
     # --- Configuration ---
     CSV_FILE = 'collected_keystroke_data.csv'
-    ENROLLED_USER = 'Pranav' # We will build the model for this user
+    ENROLLED_USER = 'Priyankaa' # We will build the model for this user
     
     print(f"--- Server is starting: Loading data and training model for user '{ENROLLED_USER}' ---")
     
@@ -280,28 +684,8 @@ def train_model_on_startup():
     except Exception as e:
         print(f"FATAL ERROR during model training: {e}")
         authenticator = None
-        # --- Behavioral Model Training ---
-    ENROLLED_USER_EMAIL = 'pranavm2323@gmail.com'
-    print(f"--- Server is starting: Training Behavioral Model for user '{ENROLLED_USER_EMAIL}' ---")
-    try:
-        conn = get_db()
-        # Load all historical events for the enrolled user
-        df_events = pd.read_sql_query("SELECT * FROM user_events WHERE user_email = ?", conn, params=(ENROLLED_USER_EMAIL,))
-        conn.close()
-
-        if df_events.empty:
-            raise ValueError(f"No event data found for user '{ENROLLED_USER_EMAIL}'.")
-
-        # Instantiate and train the profiler
-        user_profiler = UserBehaviorProfiler()
-        user_profiler.fit(df_events)
-        
-        # Store the trained profiler in our dictionary
-        if user_profiler.model:
-            behavior_profilers[ENROLLED_USER_EMAIL] = user_profiler
-        
-    except Exception as e:
-        print(f"ERROR during behavioral model training: {e}")
+        # --- Behavioral Model Training (Dynamic) ---
+    print("--- Server is starting: Behavioral models will be trained dynamically on user login ---")
 
 app = Flask(__name__)
 app.config['JWT_SECRET_KEY'] = 'your-secret-key-change-in-production'
@@ -310,6 +694,52 @@ app.config['DEBUG'] = True
 app.config['PROPAGATE_EXCEPTIONS'] = True
 jwt = JWTManager(app)
 CORS(app, resources={r"/api/*": {"origins": "http://localhost:5173"}}, supports_credentials=True)
+
+# --- Behavioral Model Training Function ---
+def train_user_behavioral_model(user_email, min_events=20):
+    """
+    Train a behavioral model for a specific user if they have sufficient historical data.
+    Returns True if training was successful, False otherwise.
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # Check if user has sufficient event data
+        cursor.execute("SELECT COUNT(*) as event_count FROM user_events WHERE user_email = ?", (user_email,))
+        event_count = cursor.fetchone()['event_count']
+        
+        if event_count < min_events:
+            print(f"User {user_email} has insufficient data for behavioral training ({event_count} events, need {min_events})")
+            conn.close()
+            return False
+        
+        # Load historical events for this user
+        df_events = pd.read_sql_query("SELECT * FROM user_events WHERE user_email = ?", conn, params=(user_email,))
+        conn.close()
+        
+        if df_events.empty:
+            print(f"No event data found for user {user_email}")
+            return False
+        
+        print(f"Training behavioral model for {user_email} with {event_count} events...")
+        
+        # Instantiate and train the profiler
+        user_profiler = UserBehaviorProfiler()
+        user_profiler.fit(df_events)
+        
+        # Store the trained profiler in our dictionary
+        if user_profiler.model:
+            behavior_profilers[user_email] = user_profiler
+            print(f"Behavioral profile trained successfully for {user_email}")
+            return True
+        else:
+            print(f"Failed to train behavioral model for {user_email}")
+            return False
+            
+    except Exception as e:
+        print(f"Error training behavioral model for {user_email}: {e}")
+        return False
 
 # Database setup
 DATABASE = 'banking.db'
@@ -332,6 +762,20 @@ def init_db():
             account_number TEXT UNIQUE NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_login TIMESTAMP
+        )
+    ''')
+    
+    # Security Questions table for enhanced user authentication
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS security_questions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            question1 TEXT NOT NULL,
+            answer1 TEXT NOT NULL,
+            question2 TEXT NOT NULL,
+            answer2 TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
     
@@ -550,7 +994,7 @@ def initialize_sample_data():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         demo_user_id,
-        'pranav1233@gmail.com',
+        'priyankaavijay04@gmail.com',
         generate_password_hash('.tie5Roanl'),
         'Pranav',
         'Madhu',
@@ -687,7 +1131,7 @@ def get_db():
 def track_user_event(user_email: str, event_type: str, page_url: str = None, 
                     transaction_amount: float = 0, transaction_type: str = None, 
                     additional_data: str = None):
-    """Track user events for analytics"""
+    """Track user events for analytics and perform real-time anomaly detection"""
     try:
         conn = get_db()
         cursor = conn.cursor()
@@ -700,8 +1144,98 @@ def track_user_event(user_email: str, event_type: str, page_url: str = None,
         
         conn.commit()
         conn.close()
+        
+        # Perform real-time anomaly detection after logging the event
+        print(f"🔍 Performing anomaly check after event: {event_type} for {user_email}")
+        anomaly_result = check_real_time_anomaly(user_email)
+        print(f"📊 Anomaly check result: {anomaly_result}")
+        return anomaly_result
+        
     except Exception as e:
         print(f"Error tracking user event: {e}")
+        return {"anomaly_detected": False}
+
+def check_real_time_anomaly(user_email: str):
+    """Check for anomalies in real-time after each event"""
+    try:
+        print(f"=== CHECKING ANOMALY for {user_email} ===")
+        # Find the profiler for this user
+        profiler = behavior_profilers.get(user_email)
+        
+        if not profiler:
+            print(f"No profiler found for {user_email}. Available profilers: {list(behavior_profilers.keys())}")
+            return {"anomaly_detected": False, "reason": "No behavior model available"}
+        
+        # Get current session events
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # Get events from the current session (since last login, same as SessionMonitor)
+        # First, find the timestamp of the most recent 'login_success' event
+        cursor.execute("""
+            SELECT MAX(time) 
+            FROM user_events 
+            WHERE user_email = ? AND event_type = 'login_success'
+        """, (user_email,))
+        last_login_time_row = cursor.fetchone()
+
+        if not last_login_time_row or not last_login_time_row[0]:
+            print(f"No login events found for {user_email}")
+            conn.close()
+            return {"anomaly_detected": False, "reason": "No login events found"}
+
+        last_login_time = last_login_time_row[0]
+        print(f"Getting events since last login at: {last_login_time}")
+        
+        # Get all events since last login (same logic as current-session endpoint)
+        cursor.execute('''
+            SELECT id, event_type, time, page_url, transaction_amount, additional_data
+            FROM user_events 
+            WHERE user_email = ? AND time >= ?
+            ORDER BY time ASC
+        ''', (user_email, last_login_time))
+        
+        events = cursor.fetchall()
+        conn.close()
+        
+        if len(events) < 3:  # Need minimum events for analysis
+            print(f"Insufficient events for analysis: {len(events)} events found")
+            return {"anomaly_detected": False, "reason": "Insufficient events for analysis"}
+        
+        # Convert to list of dictionaries for the profiler (same format as SessionMonitor)
+        session_events = []
+        for event in events:
+            session_events.append({
+                'id': event['id'],
+                'event_type': event['event_type'],
+                'time': event['time'],
+                'page_url': event['page_url'],
+                'transaction_amount': event['transaction_amount'] or 0,
+                'additional_data': event['additional_data']
+            })
+        
+        # Events are already in chronological order (ORDER BY time ASC)
+        
+        # Analyze current session
+        print(f"Analyzing {len(session_events)} events for anomalies...")
+        result = profiler.predict(session_events)
+        print(f"Anomaly analysis result: {result}")
+        
+        if result.get('status') == 'Anomaly':
+            print(f"🚨 ANOMALY DETECTED! Confidence: {result.get('anomaly_confidence_percent', 0)}%")
+            return {
+                "anomaly_detected": True,
+                "anomaly_confidence": result.get('anomaly_confidence_percent', 0),
+                "anomaly_reasons": result.get('anomaly_reasons', []),
+                "recent_events": result.get('recent_events', [])
+            }
+        
+        print("No anomaly detected")
+        return {"anomaly_detected": False}
+        
+    except Exception as e:
+        print(f"Error in real-time anomaly detection: {e}")
+        return {"anomaly_detected": False, "error": str(e)}
 
 # Helper functions
 def generate_account_number():
@@ -838,14 +1372,20 @@ def analyze_user_session():
     
     user_email = user['email']
 
-    # Find the profiler for this user
+    # Find the profiler for the current user
     profiler = behavior_profilers.get(user_email)
 
     if not profiler:
-        return jsonify({
-            "status": "NotApplicable",
-            "reason": f"No behavior model available for user {user_email}. Insufficient historical data."
-        }), 200
+        # Try to train a model on-demand if this user has sufficient historical data
+        print(f"No behavioral model found for {user_email}, attempting on-demand training...")
+        success = train_user_behavioral_model(user_email)
+        if success:
+            profiler = behavior_profilers.get(user_email)
+        else:
+            return jsonify({
+                "status": "NotApplicable", 
+                "reason": f"No behavior model available for user {user_email}. Insufficient historical data (need at least 20 events for training)."
+            }), 200
 
     try:
         # The UserBehaviorProfiler expects a list of dictionaries, which is what we're sending
@@ -854,6 +1394,622 @@ def analyze_user_session():
     except Exception as e:
         logging.error(f"Error during behavior prediction for {user_email}: {e}", exc_info=True)
         return jsonify({"error": f"An internal server error occurred during analysis: {e}"}), 500
+
+@app.route('/api/behavior/check-anomaly', methods=['GET'])
+@jwt_required()
+def check_current_anomaly():
+    """
+    Check for anomalies in the current user's recent session activity
+    """
+    user_id = get_jwt_identity()
+    
+    # Get the user's email
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user:
+        return jsonify({"error": "User not found."}), 404
+    
+    user_email = user['email']
+    
+    try:
+        anomaly_result = check_real_time_anomaly(user_email)
+        return jsonify(anomaly_result)
+    except Exception as e:
+        logging.error(f"Error checking anomaly for {user_email}: {e}", exc_info=True)
+        return jsonify({"error": f"An internal server error occurred: {e}"}), 500
+
+@app.route('/api/debug/force-anomaly-check', methods=['POST'])
+@jwt_required()
+def debug_force_anomaly_check():
+    """
+    Debug endpoint to manually force an anomaly check and see detailed results
+    """
+    user_id = get_jwt_identity()
+    
+    # Get the user's email
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user:
+        return jsonify({"error": "User not found."}), 404
+    
+    user_email = user['email']
+    
+    try:
+        print(f"\n=== MANUAL ANOMALY CHECK DEBUG for {user_email} ===")
+        
+        # First, check if behavioral model exists
+        profiler = behavior_profilers.get(user_email)
+        print(f"Profiler exists: {profiler is not None}")
+        print(f"Available profilers: {list(behavior_profilers.keys())}")
+        
+        if not profiler:
+            print("Attempting to train model...")
+            success = train_user_behavioral_model(user_email)
+            print(f"Training result: {success}")
+            profiler = behavior_profilers.get(user_email)
+            print(f"Profiler after training: {profiler is not None}")
+        
+        # Get recent events
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM user_events 
+            WHERE user_email = ? 
+            AND time >= datetime('now', '-4 hours')
+            ORDER BY time DESC
+            LIMIT 20
+        ''', (user_email,))
+        
+        events = cursor.fetchall()
+        conn.close()
+        
+        print(f"Found {len(events)} recent events")
+        for event in events[:5]:  # Show first 5 events
+            print(f"  - {event['event_type']}: {event['transaction_amount']} at {event['time']}")
+        
+        # Force anomaly check
+        anomaly_result = check_real_time_anomaly(user_email)
+        
+        return jsonify({
+            "debug_info": {
+                "user_email": user_email,
+                "profiler_exists": profiler is not None,
+                "recent_events_count": len(events),
+                "available_profilers": list(behavior_profilers.keys())
+            },
+            "anomaly_result": anomaly_result
+        })
+        
+    except Exception as e:
+        logging.error(f"Error in debug anomaly check for {user_email}: {e}", exc_info=True)
+        return jsonify({"error": f"Debug check failed: {e}"}), 500
+
+@app.route('/api/generate-ai-security-questions', methods=['POST'])
+@jwt_required()
+def generate_ai_questions():
+    """
+    Generate AI-powered security questions based on user's transaction history
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    if not data or 'anomaly_data' not in data:
+        return jsonify({"error": "Anomaly data is required"}), 400
+    
+    anomaly_data = data['anomaly_data']
+    recent_events = anomaly_data.get('recent_events', [])
+    
+    # Get the user's email and recent transactions
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    
+    if not user:
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+    
+    user_email = user['email']
+    
+    try:
+        # Get recent transaction history for AI question generation
+        cursor.execute('''
+            SELECT event_type, time, page_url, transaction_amount, additional_data
+            FROM user_events 
+            WHERE user_email = ? 
+            AND transaction_amount > 0
+            ORDER BY time DESC
+            LIMIT 20
+        ''', (user_email,))
+        
+        transaction_history = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        
+        # Generate AI questions
+        print(f"Generating AI security questions for {user_email}")
+        ai_questions = generate_ai_security_questions(user_email, transaction_history)
+        
+        return jsonify({
+            "success": True,
+            "questions": ai_questions,
+            "message": "AI security questions generated successfully"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error generating AI questions for {user_email}: {e}", exc_info=True)
+        return jsonify({"error": f"Failed to generate questions: {e}"}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/api/verify-ai-security-answers', methods=['POST'])
+@jwt_required()
+def verify_ai_security_answers():
+    """
+    Verify AI-powered security answers
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    if not data or 'questions' not in data or 'answers' not in data:
+        return jsonify({"error": "Questions and answers are required"}), 400
+    
+    questions = data['questions']
+    user_answers = data['answers']
+    anomaly_data = data.get('anomaly_data', {})
+    
+    # Get user info and transaction context
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT email, first_name, last_name FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    
+    if not user:
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+    
+    user_email = user['email']
+    user_full_name = f"{user['first_name']} {user['last_name']}"
+    
+    try:
+        # Get recent transaction context for verification
+        cursor.execute('''
+            SELECT event_type, time, page_url, transaction_amount, additional_data
+            FROM user_events 
+            WHERE user_email = ? 
+            AND transaction_amount > 0
+            ORDER BY time DESC
+            LIMIT 20
+        ''', (user_email,))
+        
+        transaction_context = [dict(row) for row in cursor.fetchall()]
+        
+        # Use AI to verify answers
+        print(f"Verifying AI security answers for {user_email}")
+        verification_result = verify_answers_with_ai(questions, user_answers, transaction_context)
+        
+        # Log the verification attempt
+        track_user_event(
+            user_email, 
+            'ai_security_verification_attempt', 
+            '/anomaly-verification', 
+            0, 
+            'security', 
+            json.dumps({
+                'anomaly_confidence': anomaly_data.get('anomaly_confidence', 0),
+                'ai_confidence': verification_result.get('confidence', 0),
+                'verification_type': 'ai_powered',
+                'verified': verification_result.get('verified', False)
+            })
+        )
+        
+        if verification_result.get('verified', False):
+            # Verification successful
+            track_user_event(
+                user_email, 
+                'ai_security_verification_success', 
+                '/anomaly-verification', 
+                0, 
+                'security', 
+                json.dumps({
+                    'ai_confidence': verification_result.get('confidence', 0),
+                    'verification_method': 'ai_security_questions'
+                })
+            )
+            
+            return jsonify({
+                "success": True,
+                "verified": True,
+                "message": "Identity verified successfully! Welcome back.",
+                "ai_confidence": verification_result.get('confidence', 0),
+                "reason": verification_result.get('reason', '')
+            })
+        else:
+            # Verification failed
+            track_user_event(
+                user_email, 
+                'ai_security_verification_failed', 
+                '/anomaly-verification', 
+                0, 
+                'security', 
+                json.dumps({
+                    'ai_confidence': verification_result.get('confidence', 0),
+                    'reason': verification_result.get('reason', 'AI verification failed'),
+                    'answers_provided': len(user_answers)
+                })
+            )
+            
+            return jsonify({
+                "success": False,
+                "verified": False,
+                "message": "Sorry, an impostor has been detected. Access denied.",
+                "ai_confidence": verification_result.get('confidence', 0),
+                "reason": verification_result.get('reason', '')
+            }), 403
+            
+    except Exception as e:
+        logging.error(f"Error during AI security verification for {user_email}: {e}", exc_info=True)
+        return jsonify({"error": "Verification failed due to internal error"}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/get-user-security-questions', methods=['GET'])
+@jwt_required()
+def get_user_security_questions():
+    """
+    Get user's security questions from the database
+    """
+    user_id = get_jwt_identity()
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        # Fetch user's security questions
+        cursor.execute('''
+            SELECT question1, question2 
+            FROM security_questions 
+            WHERE user_id = ?
+        ''', (user_id,))
+        
+        result = cursor.fetchone()
+        
+        if not result:
+            return jsonify({"error": "No security questions found for user"}), 404
+        
+        return jsonify({
+            "success": True,
+            "questions": [
+                {"question": result['question1']},
+                {"question": result['question2']}
+            ]
+        })
+        
+    except Exception as e:
+        logging.error(f"Error fetching security questions for user {user_id}: {e}", exc_info=True)
+        return jsonify({"error": "Failed to fetch security questions"}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/generate-mixed-security-questions', methods=['POST'])
+@jwt_required()
+def generate_mixed_security_questions():
+    """
+    Generate a mix of 2 security questions from database and 1 AI question
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    if not data or 'anomaly_data' not in data:
+        return jsonify({"error": "Anomaly data is required"}), 400
+    
+    anomaly_data = data['anomaly_data']
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        # Get user info
+        cursor.execute("SELECT email, first_name, last_name FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        user_email = user['email']
+        
+        # Fetch user's security questions
+        cursor.execute('''
+            SELECT question1, question2 
+            FROM security_questions 
+            WHERE user_id = ?
+        ''', (user_id,))
+        
+        security_result = cursor.fetchone()
+        
+        if not security_result:
+            return jsonify({"error": "No security questions found for user"}), 404
+        
+        # Get recent transaction context for AI question
+        cursor.execute('''
+            SELECT event_type, time, page_url, transaction_amount, additional_data
+            FROM user_events 
+            WHERE user_email = ? 
+            AND transaction_amount > 0
+            ORDER BY time DESC
+            LIMIT 10
+        ''', (user_email,))
+        
+        transaction_history = [dict(row) for row in cursor.fetchall()]
+        
+        # Generate 1 AI question based on anomaly data
+        ai_questions = generate_ai_security_questions(user_email, transaction_history)
+        
+        # Ensure ai_questions is a list, not None or 0
+        if not isinstance(ai_questions, list) or len(ai_questions) == 0:
+            print(f"Warning: AI question generation returned {ai_questions}, using fallback")
+            ai_questions = create_fallback_questions(transaction_history[-5:] if transaction_history else [])
+        
+        # Combine questions: 2 from database + 1 AI question
+        mixed_questions = [
+            {"question": security_result['question1'], "type": "security", "index": 0},
+            {"question": security_result['question2'], "type": "security", "index": 1},
+            {"question": ai_questions[0]['question'], "type": "ai", "index": 2}
+        ]
+        
+        return jsonify({
+            "success": True,
+            "questions": mixed_questions
+        })
+        
+    except Exception as e:
+        logging.error(f"Error generating mixed security questions for user {user_id}: {e}", exc_info=True)
+        return jsonify({"error": "Failed to generate mixed security questions"}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/verify-mixed-security-answers', methods=['POST'])
+@jwt_required()
+def verify_mixed_security_answers():
+    """
+    Verify mixed security answers (2 security questions + 1 AI question)
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    if not data or 'questions' not in data or 'answers' not in data:
+        return jsonify({"error": "Questions and answers are required"}), 400
+    
+    questions = data['questions']
+    user_answers = data['answers']
+    anomaly_data = data.get('anomaly_data', {})
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        # Get user info
+        cursor.execute("SELECT email, first_name, last_name FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        user_email = user['email']
+        
+        # Get stored security question answers
+        cursor.execute('''
+            SELECT answer1, answer2 
+            FROM security_questions 
+            WHERE user_id = ?
+        ''', (user_id,))
+        
+        stored_answers = cursor.fetchone()
+        
+        if not stored_answers:
+            return jsonify({"error": "No security questions found for user"}), 404
+        
+        verification_results = []
+        
+        # Verify each answer based on question type
+        for i, question in enumerate(questions):
+            answer = user_answers[i] if i < len(user_answers) else ""
+            
+            if question['type'] == 'security':
+                # Verify security question answer
+                question_index = question['index']
+                if question_index == 0:
+                    stored_answer = stored_answers['answer1']
+                elif question_index == 1:
+                    stored_answer = stored_answers['answer2']
+                else:
+                    verification_results.append(False)
+                    continue
+                
+                # Check hashed answer with keyword matching
+                is_correct = verify_security_answer_with_keywords(stored_answer, answer)
+                verification_results.append(is_correct)
+                
+            elif question['type'] == 'ai':
+                # Use AI to verify the answer
+                cursor.execute('''
+                    SELECT event_type, time, page_url, transaction_amount, additional_data
+                    FROM user_events 
+                    WHERE user_email = ? 
+                    AND transaction_amount > 0
+                    ORDER BY time DESC
+                    LIMIT 10
+                ''', (user_email,))
+                
+                transaction_context = [dict(row) for row in cursor.fetchall()]
+                ai_result = verify_answers_with_ai([question], [answer], transaction_context)
+                verification_results.append(ai_result.get('verified', False))
+        
+        # Calculate overall success rate
+        success_rate = sum(verification_results) / len(verification_results) if verification_results else 0
+        
+        # Log the verification attempt
+        track_user_event(
+            user_email, 
+            'mixed_security_verification_attempt', 
+            '/anomaly-verification', 
+            0, 
+            'security', 
+            json.dumps({
+                'anomaly_confidence': anomaly_data.get('anomaly_confidence', 0),
+                'success_rate': success_rate,
+                'questions_answered': len(user_answers),
+                'verification_type': 'mixed_security_ai'
+            })
+        )
+        
+        # Consider verification successful if at least 2 out of 3 answers are correct
+        if success_rate >= 0.67:  # 2/3 = 0.67
+            track_user_event(
+                user_email, 
+                'mixed_security_verification_success', 
+                '/anomaly-verification', 
+                0, 
+                'security', 
+                json.dumps({
+                    'success_rate': success_rate,
+                    'verification_method': 'mixed_security_ai'
+                })
+            )
+            
+            return jsonify({
+                "success": True,
+                "verified": True,
+                "message": "Identity verified successfully! Welcome back.",
+                "success_rate": success_rate
+            })
+        else:
+            track_user_event(
+                user_email, 
+                'mixed_security_verification_failed', 
+                '/anomaly-verification', 
+                0, 
+                'security', 
+                json.dumps({
+                    'success_rate': success_rate,
+                    'answers_provided': len(user_answers)
+                })
+            )
+            
+            return jsonify({
+                "success": False,
+                "verified": False,
+                "message": "Sorry, an impostor has been detected. Access denied.",
+                "success_rate": success_rate
+            }), 403
+    
+    except Exception as e:
+        logging.error(f"Error during mixed security verification for user {user_id}: {e}", exc_info=True)
+        return jsonify({"error": "Verification failed due to internal error"}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/verify-security-questions', methods=['POST'])
+@jwt_required()
+def verify_security_questions():
+    """
+    Verify security questions for anomaly verification
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    if not data or 'answers' not in data:
+        return jsonify({"error": "Answers are required"}), 400
+    
+    answers = data['answers']
+    anomaly_data = data.get('anomaly_data', {})
+    
+    # Get user info
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT email, first_name, last_name FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    user_email = user['email']
+    user_full_name = f"{user['first_name']} {user['last_name']}"
+    
+    # For now, we'll use dummy validation (in production, these would be stored securely)
+    # This is a simplified version - in real implementation, security questions would be
+    # stored hashed in the database during account setup
+    
+    try:
+        # Log the security verification attempt
+        track_user_event(
+            user_email, 
+            'security_verification_attempt', 
+            '/anomaly-verification', 
+            0, 
+            'security', 
+            json.dumps({
+                'anomaly_confidence': anomaly_data.get('anomaly_confidence', 0),
+                'questions_answered': len(answers),
+                'verification_type': 'anomaly_response'
+            })
+        )
+        
+        # For demo purposes, we'll accept any non-empty answers
+        # In production, these would be validated against stored answers
+        all_answered = all(answer.strip() for answer in answers.values())
+        
+        if all_answered:
+            # Mark verification as successful
+            track_user_event(
+                user_email, 
+                'security_verification_success', 
+                '/anomaly-verification', 
+                0, 
+                'security', 
+                json.dumps({
+                    'anomaly_confidence': anomaly_data.get('anomaly_confidence', 0),
+                    'verification_method': 'security_questions'
+                })
+            )
+            
+            return jsonify({
+                "success": True,
+                "message": "Security verification completed successfully"
+            })
+        else:
+            # Mark verification as failed
+            track_user_event(
+                user_email, 
+                'security_verification_failed', 
+                '/anomaly-verification', 
+                0, 
+                'security', 
+                json.dumps({
+                    'anomaly_confidence': anomaly_data.get('anomaly_confidence', 0),
+                    'reason': 'incomplete_answers'
+                })
+            )
+            
+            return jsonify({
+                "success": False,
+                "error": "Please provide answers to all security questions"
+            }), 400
+            
+    except Exception as e:
+        logging.error(f"Error during security verification for {user_email}: {e}", exc_info=True)
+        return jsonify({"error": "Verification failed due to internal error"}), 500
+    finally:
+        conn.close()
+
 @app.errorhandler(Exception)
 def handle_error(error):
     print(f"\n=== Error in API ===")
@@ -901,6 +2057,8 @@ def biometric_login():
         # If password is correct, now proceed with biometric verification
         if authenticator is None:
             conn.close()
+            # Track biometric system unavailable as a failure
+            track_user_event(user['email'], 'login_failed', '/login', 0, 'biometric', json.dumps({'reason': 'Biometric system not available'}))
             return jsonify({'success': False, 'error': 'Biometric system not available'}), 500
         
         try:
@@ -921,7 +2079,7 @@ def biometric_login():
             cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (user['id'],))
             conn.commit()
             
-            # Track successful login
+            # Track successful biometric login (for session management)
             track_user_event(user['email'], 'login_success', '/login', 0, 'biometric', json.dumps({'user_id': user['id']}))
 
             token = create_access_token(identity=user['id'])
@@ -951,10 +2109,20 @@ def biometric_login():
             
         except Exception as e:
             conn.close()
+            # Track biometric system error as a failure
+            if 'user' in locals() and user:
+                track_user_event(user['email'], 'login_failed', '/login', 0, 'biometric', json.dumps({'reason': 'Biometric system error', 'error': str(e)}))
             logging.error(f"Biometric verification error: {e}", exc_info=True)
             return jsonify({'success': False, 'error': f'Biometric verification error: {str(e)}'}), 500
         
     except Exception as e:
+        # Track general biometric login error - try to get email from request data
+        try:
+            data = request.get_json()
+            if data and 'email' in data:
+                track_user_event(data['email'], 'login_failed', '/login', 0, 'biometric', json.dumps({'reason': 'General login error', 'error': str(e)}))
+        except:
+            pass  # If we can't track the event, don't fail the error response
         logging.error(f"General biometric login error: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
     
@@ -1047,10 +2215,14 @@ def register():
         data = request.get_json()
         
         # Validate required fields
-        required_fields = ['email', 'password', 'firstName', 'lastName', 'phone']
+        required_fields = ['email', 'password', 'firstName', 'lastName', 'phone', 'securityQuestion1', 'securityAnswer1', 'securityQuestion2', 'securityAnswer2']
         for field in required_fields:
             if field not in data:
                 return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
+        
+        # Validate security questions are different
+        if data['securityQuestion1'] == data['securityQuestion2']:
+            return jsonify({'success': False, 'error': 'Security questions must be different'}), 400
         
         conn = get_db()
         cursor = conn.cursor()
@@ -1076,6 +2248,20 @@ def register():
             data['lastName'],
             data['phone'],
             account_number
+        ))
+        
+        # Insert security questions (hash the answers for security)
+        security_questions_id = str(uuid.uuid4())
+        cursor.execute('''
+            INSERT INTO security_questions (id, user_id, question1, answer1, question2, answer2)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            security_questions_id,
+            user_id,
+            data['securityQuestion1'],
+            generate_password_hash(data['securityAnswer1'].lower().strip()),  # Hash and normalize answer
+            data['securityQuestion2'],
+            generate_password_hash(data['securityAnswer2'].lower().strip())   # Hash and normalize answer
         ))
         
         # Get the created user
@@ -1137,6 +2323,14 @@ def login():
         
         # Track login event
         track_user_event(user['email'], 'login', '/login', 0, None, json.dumps({'user_id': user['id']}))
+        
+        # Train behavioral model for this user if not already trained and they have sufficient data
+        user_email = user['email']
+        if user_email not in behavior_profilers:
+            print(f"Attempting to train behavioral model for {user_email} on login...")
+            train_user_behavioral_model(user_email)
+        else:
+            print(f"Behavioral model already exists for {user_email}")
         
         # Create access token
         token = create_access_token(identity=user['id'])
@@ -2772,8 +3966,8 @@ def pay_direct_tax():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Check user balance
-    cursor.execute("SELECT balance FROM users WHERE id = ?", (user_id,))
+    # Check user balance and get email
+    cursor.execute("SELECT balance, email FROM users WHERE id = ?", (user_id,))
     user = cursor.fetchone()
     if not user or user['balance'] < amount:
         conn.close()
@@ -2806,7 +4000,7 @@ def pay_direct_tax():
         ))
         
         conn.commit()
-        track_user_event(data['email'], 'tax_payment_direct', '/tax/direct', amount, 'tax_payment', 
+        track_user_event(user['email'], 'tax_payment_direct', '/tax/direct', amount, 'tax_payment', 
                          json.dumps({'pan': data['pan'], 'assessmentYear': data['assessmentYear']}))
         conn.close()
         

@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useAuth } from "@/contexts/AuthContext";
@@ -21,6 +22,10 @@ export default function Register() {
     lastName: "",
     email: "",
     phone: "",
+    securityQuestion1: "",
+    securityAnswer1: "",
+    securityQuestion2: "",
+    securityAnswer2: "",
     password: "",
     confirmPassword: "",
   });
@@ -51,6 +56,21 @@ export default function Register() {
 
     if (formData.phone.length < 10) {
       setError("Please enter a valid phone number");
+      return false;
+    }
+
+    if (!formData.securityQuestion1.trim() || !formData.securityAnswer1.trim()) {
+      setError("Please provide the first security question and answer");
+      return false;
+    }
+
+    if (!formData.securityQuestion2.trim() || !formData.securityAnswer2.trim()) {
+      setError("Please provide the second security question and answer");
+      return false;
+    }
+
+    if (formData.securityQuestion1 === formData.securityQuestion2) {
+      setError("Security questions must be different");
       return false;
     }
 
@@ -167,6 +187,69 @@ export default function Register() {
                   required
                   disabled={isSubmitting}
                 />
+              </div>
+
+              {/* Security Questions Section */}
+              <div className="space-y-4 p-4 bg-blue-50 rounded-lg border border-blue-200">
+                <h3 className="text-sm font-medium text-blue-900 mb-2">
+                  Security Questions (for account recovery)
+                </h3>
+                
+                <div className="space-y-2">
+                  <Label htmlFor="securityQuestion1">Security Question 1</Label>
+                  <Input
+                    id="securityQuestion1"
+                    name="securityQuestion1"
+                    type="text"
+                    value={formData.securityQuestion1}
+                    onChange={handleChange}
+                    placeholder="e.g., What is your mother's maiden name?"
+                    required
+                    disabled={isSubmitting}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="securityAnswer1">Answer 1</Label>
+                  <Input
+                    id="securityAnswer1"
+                    name="securityAnswer1"
+                    type="text"
+                    value={formData.securityAnswer1}
+                    onChange={handleChange}
+                    placeholder="Enter your answer"
+                    required
+                    disabled={isSubmitting}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="securityQuestion2">Security Question 2</Label>
+                  <Input
+                    id="securityQuestion2"
+                    name="securityQuestion2"
+                    type="text"
+                    value={formData.securityQuestion2}
+                    onChange={handleChange}
+                    placeholder="e.g., What was the name of your first pet?"
+                    required
+                    disabled={isSubmitting}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="securityAnswer2">Answer 2</Label>
+                  <Input
+                    id="securityAnswer2"
+                    name="securityAnswer2"
+                    type="text"
+                    value={formData.securityAnswer2}
+                    onChange={handleChange}
+                    placeholder="Enter your answer"
+                    required
+                    disabled={isSubmitting}
+                  />
+                </div>
               </div>
 
               <div className="space-y-2">

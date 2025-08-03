@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
 import { NotificationBell } from "@/components/NotificationBell";
+import { useAnomalyDetection } from "@/services/anomalyService";
 import {
   User,
   Home,
@@ -42,6 +43,9 @@ export function BankingLayout({ children }: BankingLayoutProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const { user, logout } = useAuth();
+  
+  // Enable automatic anomaly detection for all pages using this layout
+  useAnomalyDetection(true);
 
   const handleLogout = () => {
     logout();

@@ -7,7 +7,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/contexts/AuthContext";
 import { useNotifications } from "@/contexts/NotificationContext";
 import { transfersApi, Beneficiary } from "@/services/transfersapi";
+import { checkAnomalyAfterTransaction } from "@/services/anomalyService";
 import { useState, useEffect, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Send,
   UserPlus,
@@ -27,6 +29,7 @@ import {
 export default function PaymentsTransfers() {
   const { user, fetchAndSetProfile } = useAuth();
   const { addNotification } = useNotifications();
+  const navigate = useNavigate();
   const [beneficiaries, setBeneficiaries] = useState<Beneficiary[]>([]);
   const [recentTransfers, setRecentTransfers] = useState<any[]>([]);
   const [allTransfers, setAllTransfers] = useState<any[]>([]);
@@ -166,6 +169,19 @@ export default function PaymentsTransfers() {
         await fetchAndSetProfile();
         await loadRecentTransfers();
         alert('Transfer successful!');
+        
+        // Check for anomalies after successful transfer
+        const anomalyDetected = await checkAnomalyAfterTransaction(
+          'own_account_transfer', 
+          parseFloat(ownTransferForm.amount),
+          navigate,
+          '/transfers'
+        );
+        
+        if (anomalyDetected) {
+          // User will be redirected to anomaly verification page
+          return;
+        }
       } else {
         alert(response.error || 'Transfer failed');
       }
@@ -202,6 +218,19 @@ export default function PaymentsTransfers() {
         await fetchAndSetProfile();
         await loadRecentTransfers();
         alert('Transfer successful!');
+        
+        // Check for anomalies after successful transfer
+        const anomalyDetected = await checkAnomalyAfterTransaction(
+          'beneficiary_transfer', 
+          parseFloat(transferForm.amount),
+          navigate,
+          '/transfers'
+        );
+        
+        if (anomalyDetected) {
+          // User will be redirected to anomaly verification page
+          return;
+        }
       } else {
         alert(response.error || 'Transfer failed');
       }

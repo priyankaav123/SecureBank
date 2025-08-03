@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -30,6 +31,7 @@ import { BankingLayout } from '@/components/layout/BankingLayout';
 import { useAuth } from '@/contexts/AuthContext';
 import { useNotifications } from '@/contexts/NotificationContext';
 import { billPaymentsApi, Biller, AutoPayRule } from '@/services/billPaymentsapi';
+import { checkAnomalyAfterTransaction } from '@/services/anomalyService';
 
 // --- CONSTANTS (moved outside for better organization) ---
 const billCategories = [
@@ -553,6 +555,7 @@ const AutoPayView = ({ resetToDashboard, autoPayRules, registeredBillers, addAut
 export default function BillPayments() {
   const { user, fetchAndSetProfile } = useAuth();
   const { addNotification } = useNotifications();
+  const navigate = useNavigate();
   const [currentView, setCurrentView] = useState('dashboard');
   const [selectedBill, setSelectedBill] = useState<Biller | null>(null);
   
@@ -725,6 +728,19 @@ export default function BillPayments() {
         // Refresh user balance and payment history
         await fetchAndSetProfile();
         await loadPaymentHistory();
+        
+        // Check for anomalies after successful bill payment
+        const anomalyDetected = await checkAnomalyAfterTransaction(
+          'bill_payment',
+          paymentAmount,
+          navigate,
+          '/bills'
+        );
+        
+        if (anomalyDetected) {
+          // User will be redirected to anomaly verification page
+          return;
+        }
       } else {
         setPaymentResult({ success: false, message: response.error || "Payment failed" });
       }

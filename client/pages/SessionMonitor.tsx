@@ -20,6 +20,11 @@ interface AnalysisResult {
   anomaly_confidence_percent?: number;
   raw_score?: number;
   reason?: string;
+  anomaly_reasons?: string[];
+  recent_events?: Array<{
+    action: string;
+    details: string;
+  }>;
 }
 
 const API_BASE_URL = 'http://localhost:5000/api';
@@ -138,12 +143,45 @@ export default function SessionMonitor() {
                 Analysis Result: {analysisResult.status}
               </CardTitle>
             </CardHeader>
-            <CardContent className="space-y-2">
+            <CardContent className="space-y-4">
               {analysisResult.anomaly_confidence_percent !== undefined && (
                 <p><strong>Anomaly Confidence:</strong> {analysisResult.anomaly_confidence_percent.toFixed(2)}%</p>
               )}
               {analysisResult.reason && (
                 <p><strong>Reason:</strong> {analysisResult.reason}</p>
+              )}
+              
+              {/* Display anomaly reasons if available */}
+              {analysisResult.anomaly_reasons && analysisResult.anomaly_reasons.length > 0 && (
+                <div className="space-y-2">
+                  <p className="font-semibold text-red-700">Anomaly Reasons:</p>
+                  <ul className="list-disc list-inside space-y-1 text-sm bg-red-50 p-3 rounded-md border border-red-200">
+                    {analysisResult.anomaly_reasons.map((reason, index) => (
+                      <li key={index} className="text-red-800">{reason}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              
+              {/* Display recent events if available */}
+              {analysisResult.recent_events && analysisResult.recent_events.length > 0 && (
+                <div className="space-y-2">
+                  <p className="font-semibold text-gray-700">Recent Session Activity:</p>
+                  <div className="bg-gray-50 p-3 rounded-md border border-gray-200 max-h-48 overflow-y-auto">
+                    <ul className="space-y-2 text-sm">
+                      {analysisResult.recent_events.map((event, index) => (
+                        <li key={index} className="flex justify-between items-start">
+                          <span className="font-medium text-gray-800 capitalize">
+                            {event.action.replace(/_/g, ' ')}
+                          </span>
+                          <span className="text-gray-600 text-xs ml-2">
+                            {event.details}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
               )}
             </CardContent>
           </Card>
@@ -175,18 +213,46 @@ export default function SessionMonitor() {
             </CardHeader>
             <CardContent>
               <ul className="divide-y divide-gray-200">
-                {sessionEvents.map((event) => (
-                  <li key={event.id} className="py-3 px-1 grid grid-cols-3 md:grid-cols-4 gap-4 items-center">
-                    <div className="font-mono text-gray-700">{formatTime(event.time)}</div>
-                    <div className="font-semibold text-gray-900 col-span-2 md:col-span-1">{event.event_type.replace(/_/g, ' ')}</div>
-                    <div className="hidden md:block text-gray-600">{event.page_url}</div>
-                    <div className="text-right font-medium">
-                      {event.transaction_amount && event.transaction_amount > 0 ? (
-                        <span className="text-green-600">₹{event.transaction_amount.toLocaleString()}</span>
-                      ) : null}
-                    </div>
-                  </li>
-                ))}
+                {sessionEvents.map((event) => {
+                  // Parse additional data to check for biometric failures
+                  let additionalData = {};
+                  try {
+                    additionalData = event.additional_data ? JSON.parse(event.additional_data) : {};
+                  } catch (e) {
+                    additionalData = {};
+                  }
+                  
+                  // Check if this is a biometric authentication failure
+                  const isBiometricFailure = event.event_type === 'login_failed' && 
+                    (event.page_url === '/login' || additionalData.reason?.includes('Biometric') || additionalData.reason?.includes('biometric'));
+                  
+                  return (
+                    <li key={event.id} className={`py-3 px-1 grid grid-cols-3 md:grid-cols-4 gap-4 items-center ${
+                      isBiometricFailure ? 'bg-red-50 border border-red-200 rounded-md' : ''
+                    }`}>
+                      <div className="font-mono text-gray-700">{formatTime(event.time)}</div>
+                      <div className={`font-semibold col-span-2 md:col-span-1 ${
+                        isBiometricFailure ? 'text-red-700' : 'text-gray-900'
+                      }`}>
+                        {isBiometricFailure && <ShieldAlert className="inline w-4 h-4 mr-1" />}
+                        {event.event_type.replace(/_/g, ' ')}
+                        {isBiometricFailure && (
+                          <span className="text-xs text-red-600 block">
+                            🔐 {additionalData.reason || 'Biometric authentication failed'}
+                          </span>
+                        )}
+                      </div>
+                      <div className="hidden md:block text-gray-600">{event.page_url}</div>
+                      <div className="text-right font-medium">
+                        {event.transaction_amount && event.transaction_amount > 0 ? (
+                          <span className="text-green-600">₹{event.transaction_amount.toLocaleString()}</span>
+                        ) : isBiometricFailure ? (
+                          <span className="text-red-600 text-xs">SECURITY ALERT</span>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             </CardContent>
           </Card>

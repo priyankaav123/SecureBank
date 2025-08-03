@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import { BankingLayout } from "@/components/layout/BankingLayout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -38,6 +39,7 @@ import {
   FileText,
 } from "lucide-react";
 import { fixedDepositsApi, FixedDeposit, FDDetails, FDCertificate } from "@/services/api";
+import { checkAnomalyAfterTransaction } from "@/services/anomalyService";
 
 export default function FixedDeposits() {
   const [fdAmount, setFdAmount] = useState("");
@@ -51,6 +53,7 @@ export default function FixedDeposits() {
   const [showDetailsDialog, setShowDetailsDialog] = useState(false);
   const [showCertificateDialog, setShowCertificateDialog] = useState(false);
   const { toast } = useToast();
+  const navigate = useNavigate();
 
   // Interest rates configuration
   const interestRates = {
@@ -130,6 +133,19 @@ export default function FixedDeposits() {
         
         // Reload fixed deposits
         await loadFixedDeposits();
+        
+        // Check for anomalies after successful FD creation
+        const anomalyDetected = await checkAnomalyAfterTransaction(
+          'fd_created',
+          parseFloat(fdAmount),
+          navigate,
+          '/fixed-deposits'
+        );
+        
+        if (anomalyDetected) {
+          // User will be redirected to anomaly verification page
+          return;
+        }
       }
     } catch (error: any) {
       toast({

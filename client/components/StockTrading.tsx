@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -7,6 +8,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { stocksApi, Stock } from "@/services/api";
 import { useAuth } from "@/contexts/AuthContext";
+import { checkAnomalyAfterTransaction } from "@/services/anomalyService";
 import {
   ShoppingCart,
   DollarSign,
@@ -34,6 +36,7 @@ export function StockTrading({
   } | null>(null);
 
   const { user } = useAuth();
+  const navigate = useNavigate();
 
   const handleBuy = async () => {
     if (!quantity || parseInt(quantity) <= 0) {
@@ -62,6 +65,19 @@ export function StockTrading({
         });
         setQuantity("");
         onTransactionComplete?.();
+        
+        // Check for anomalies after successful stock purchase
+        const anomalyDetected = await checkAnomalyAfterTransaction(
+          'stock_buy',
+          totalCost,
+          navigate,
+          `/stocks/${stock.symbol}`
+        );
+        
+        if (anomalyDetected) {
+          // User will be redirected to anomaly verification page
+          return;
+        }
       } else {
         setMessage({
           type: "error",
@@ -100,6 +116,19 @@ export function StockTrading({
         });
         setQuantity("");
         onTransactionComplete?.();
+        
+        // Check for anomalies after successful stock sale
+        const anomalyDetected = await checkAnomalyAfterTransaction(
+          'stock_sell',
+          netProceeds,
+          navigate,
+          `/stocks/${stock.symbol}`
+        );
+        
+        if (anomalyDetected) {
+          // User will be redirected to anomaly verification page
+          return;
+        }
       } else {
         setMessage({
           type: "error",

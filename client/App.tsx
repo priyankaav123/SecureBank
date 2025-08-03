@@ -20,6 +20,8 @@ import ETax from "./pages/ETax";
 import FixedDeposits from "./pages/FixedDeposits";
 import StockInvestments from "./pages/StockInvestments";
 import SessionMonitor from "./pages/SessionMonitor";
+import AnomalyDebug from "./pages/AnomalyDebug";
+import AnomalyVerification from "./pages/AnomalyVerification";
 const App = () => (
   <TooltipProvider>
     <AuthProvider>
@@ -102,6 +104,22 @@ const App = () => (
               element={
                 <ProtectedRoute>
                   <SessionMonitor />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/anomaly-debug"
+              element={
+                <ProtectedRoute>
+                  <AnomalyDebug />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/anomaly-verification"
+              element={
+                <ProtectedRoute>
+                  <AnomalyVerification/>
                 </ProtectedRoute>
               }
             />
