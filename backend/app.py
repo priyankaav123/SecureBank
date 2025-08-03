@@ -392,7 +392,7 @@ class UserBehaviorProfiler:
         return reasons
     
 # Groq AI Configuration
-GROQ_API_KEY = "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"
+GROQ_API_KEY = "API_KEY"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
